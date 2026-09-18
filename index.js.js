@@ -159,8 +159,6 @@ function startReminderChecker() {
     try {
       const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
 
-      // Buscar tarefas "em_andamento" que não foram atualizadas há mais de 4 horas
-      // e que ainda não receberam lembrete recente
       const { data: forgottenTasks, error } = await supabase
         .from('tasks')
         .select('*')
@@ -169,7 +167,6 @@ function startReminderChecker() {
 
       if (error || !forgottenTasks || forgottenTasks.length === 0) return;
 
-      // Buscar canais de logs configurados em todos os servidores
       const { data: settings } = await supabase
         .from('log_settings')
         .select('*');
@@ -193,7 +190,6 @@ function startReminderChecker() {
           .setFooter({ text: 'Por favor, atualize ou conclua o chamado assim que possível!' })
           .setTimestamp();
 
-        // Enviar para os canais de log configurados
         for (const setting of settings) {
           try {
             const guild = await client.guilds.fetch(setting.guild_id);
@@ -208,7 +204,6 @@ function startReminderChecker() {
           }
         }
 
-        // Atualizar updated_at para não repetir o lembrete imediatamente
         await supabase
           .from('tasks')
           .update({ updated_at: new Date().toISOString() })
@@ -217,7 +212,7 @@ function startReminderChecker() {
     } catch (err) {
       console.error('Erro na automação de lembretes:', err);
     }
-  }, 30 * 60 * 1000); // 30 minutos
+  }, 30 * 60 * 1000);
 }
 
 // Função auxiliar para gerar o Embed do /tarefas
@@ -376,8 +371,8 @@ client.on('interactionCreate', async (interaction) => {
           .select();
 
         if (error) {
-          console.error(error);
-          await interaction.reply({ content: '❌ Erro ao registrar tarefa no banco de dados Supabase.', ephemeral: true });
+          console.error('Erro ao criar tarefa via slash command:', error);
+          await interaction.reply({ content: `❌ Erro no Supabase: \`${error.message || JSON.stringify(error)}\``, flags: 64 });
           return;
         }
 
@@ -390,7 +385,6 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      // Comando /empresa
       if (commandName === 'empresa') {
         await interaction.deferReply();
         const nomeEmpresa = interaction.options.getString('nome');
@@ -404,7 +398,7 @@ client.on('interactionCreate', async (interaction) => {
 
         if (error) {
           console.error(error);
-          await interaction.editReply('❌ Erro ao buscar tarefas da empresa.');
+          await interaction.editReply(`❌ Erro ao buscar tarefas da empresa: \`${error.message}\``);
           return;
         }
 
@@ -450,11 +444,11 @@ client.on('interactionCreate', async (interaction) => {
 
         if (error) {
           console.error(error);
-          await interaction.reply({ content: '❌ Erro ao salvar configurações no Supabase.', ephemeral: true });
+          await interaction.reply({ content: `❌ Erro no Supabase: \`${error.message}\``, flags: 64 });
           return;
         }
 
-        await interaction.reply({ content: `✅ Canal de logs e lembretes definido para: ${channel}`, ephemeral: true });
+        await interaction.reply({ content: `✅ Canal de logs e lembretes definido para: ${channel}`, flags: 64 });
         return;
       }
     }
@@ -525,7 +519,7 @@ client.on('interactionCreate', async (interaction) => {
           .limit(25);
 
         if (!openTasks || openTasks.length === 0) {
-          await interaction.reply({ content: '❌ Não há nenhuma tarefa em aberto para assumir.', ephemeral: true });
+          await interaction.reply({ content: '❌ Não há nenhuma tarefa em aberto para assumir.', flags: 64 });
           return;
         }
 
@@ -543,7 +537,7 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.reply({
           content: '👇 Escolha qual tarefa você deseja assumir:',
           components: [new ActionRowBuilder().addComponents(selectMenu)],
-          ephemeral: true
+          flags: 64
         });
         return;
       }
@@ -557,7 +551,7 @@ client.on('interactionCreate', async (interaction) => {
           .limit(25);
 
         if (!inProgress || inProgress.length === 0) {
-          await interaction.reply({ content: '❌ Não há nenhuma tarefa pendente para concluir.', ephemeral: true });
+          await interaction.reply({ content: '❌ Não há nenhuma tarefa pendente para concluir.', flags: 64 });
           return;
         }
 
@@ -575,7 +569,7 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.reply({
           content: '🎉 Escolha a tarefa que você finalizou:',
           components: [new ActionRowBuilder().addComponents(selectMenu)],
-          ephemeral: true
+          flags: 64
         });
         return;
       }
@@ -615,7 +609,7 @@ client.on('interactionCreate', async (interaction) => {
           .select();
 
         if (error || !data || data.length === 0) {
-          await interaction.reply({ content: '❌ Erro ao assumir tarefa.', ephemeral: true });
+          await interaction.reply({ content: `❌ Erro ao assumir tarefa: \`${error?.message || 'Erro desconhecido'}\``, flags: 64 });
           return;
         }
 
@@ -643,7 +637,7 @@ client.on('interactionCreate', async (interaction) => {
           .select();
 
         if (error || !data || data.length === 0) {
-          await interaction.reply({ content: '❌ Erro ao concluir tarefa.', ephemeral: true });
+          await interaction.reply({ content: `❌ Erro ao concluir tarefa: \`${error?.message || 'Erro desconhecido'}\``, flags: 64 });
           return;
         }
 
@@ -713,8 +707,8 @@ client.on('interactionCreate', async (interaction) => {
           .select();
 
         if (error) {
-          console.error(error);
-          await interaction.reply({ content: '❌ Erro ao registrar tarefa via modal.', ephemeral: true });
+          console.error('Erro no modal do Supabase:', error);
+          await interaction.reply({ content: `❌ Erro no Supabase via Modal: \`${error.message || JSON.stringify(error)}\``, flags: 64 });
           return;
         }
 
