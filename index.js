@@ -21,6 +21,7 @@ const {
   TextInputBuilder,
   TextInputStyle,
   PermissionFlagsBits,
+  Partials,
   Events
 } = require('discord.js');
 
@@ -77,7 +78,12 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent
+  ],
+  partials: [
+    Partials.Message,
+    Partials.Channel
   ]
 });
 
@@ -139,6 +145,233 @@ function getPriorityVisual(priority) {
   };
 
   return priorities[priority || 'media'] || priorities.media;
+}
+
+function formatDuration(startDate, endDate = new Date().toISOString()) {
+  if (!startDate) return 'Tempo não disponível';
+
+  const start = new Date(startDate).getTime();
+  const end = new Date(endDate).getTime();
+  const totalMinutes = Math.max(0, Math.floor((end - start) / 60000));
+
+  if (totalMinutes < 1) return 'Menos de 1 minuto';
+  if (totalMinutes < 60) return `${totalMinutes} min`;
+
+  const totalHours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+
+  if (totalHours < 24) {
+    return minutes > 0
+      ? `${totalHours}h ${minutes}min`
+      : `${totalHours}h`;
+  }
+
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+}
+
+const logChannelCache = new Map();
+
+async function getConfiguredLogChannel(guild) {
+  if (!guild) return null;
+
+  let logChannelId;
+
+  if (logChannelCache.has(guild.id)) {
+    logChannelId = logChannelCache.get(guild.id);
+  } else {
+    const { data, error } = await supabase
+      .from('log_settings')
+      .select('log_channel_id')
+      .eq('guild_id', guild.id)
+      .maybeSingle();
+
+    if (error) {
+      console.error('Erro ao localizar o canal de auditoria:', error);
+      return null;
+    }
+
+    logChannelId = data?.log_channel_id || null;
+    logChannelCache.set(guild.id, logChannelId);
+  }
+
+  if (!logChannelId) return null;
+
+  try {
+    const channel =
+      guild.channels.cache.get(logChannelId) ||
+      await guild.channels.fetch(logChannelId);
+
+    return channel?.isTextBased() ? channel : null;
+  } catch (error) {
+    console.error('Não foi possível acessar o canal de auditoria:', error.message);
+    return null;
+  }
+}
+
+async function sendAuditLog(guild, payload) {
+  try {
+    const channel = await getConfiguredLogChannel(guild);
+    if (!channel) return false;
+
+    await channel.send(payload);
+    return true;
+  } catch (error) {
+    console.error('Erro ao enviar registro de auditoria:', error.message);
+    return false;
+  }
+}
+
+function flattenInteractionOptions(options = []) {
+  const lines = [];
+
+  for (const option of options) {
+    if (option.options) {
+      lines.push(...flattenInteractionOptions(option.options));
+    } else {
+      lines.push(`**${option.name}:** ${truncateText(option.value ?? 'não informado', 300)}`);
+    }
+  }
+
+  return lines;
+}
+
+async function logInteractionAudit(interaction) {
+  if (!interaction.guild || !interaction.user || interaction.user.bot) return;
+
+  let actionType = 'Interação';
+  let details = 'Sem detalhes adicionais.';
+
+  if (interaction.isChatInputCommand()) {
+    actionType = `Comando /${interaction.commandName}`;
+    const options = flattenInteractionOptions(interaction.options.data);
+    details = options.length > 0 ? options.join('\n') : 'Comando executado sem opções.';
+  } else if (interaction.isButton()) {
+    actionType = 'Clique em botão';
+    details = `**Botão:** ${interaction.customId}`;
+  } else if (interaction.isStringSelectMenu()) {
+    actionType = 'Seleção em menu';
+    details =
+      `**Menu:** ${interaction.customId}\n` +
+      `**Valor selecionado:** ${interaction.values.join(', ')}`;
+  } else if (interaction.isModalSubmit()) {
+    actionType = 'Formulário enviado';
+    const fields = Array.from(interaction.fields.fields.values()).map(field =>
+      `**${field.customId}:** ${truncateText(field.value || 'vazio', 500)}`
+    );
+    details = fields.join('\n') || 'Formulário sem campos.';
+  } else {
+    return;
+  }
+
+  const embed = new EmbedBuilder()
+    .setTitle('🖱️ Ação Registrada')
+    .setColor('#5865F2')
+    .addFields(
+      {
+        name: '👤 Pessoa',
+        value: `<@${interaction.user.id}> (${interaction.user.username})`,
+        inline: true
+      },
+      {
+        name: '⚙️ Ação',
+        value: truncateText(actionType, 1024),
+        inline: true
+      },
+      {
+        name: '📍 Canal',
+        value: interaction.channelId ? `<#${interaction.channelId}>` : 'Não informado',
+        inline: true
+      },
+      {
+        name: '📋 Detalhes',
+        value: truncateText(details, 1024),
+        inline: false
+      }
+    )
+    .setTimestamp();
+
+  await sendAuditLog(interaction.guild, { embeds: [embed] });
+}
+
+async function sendTaskLifecycleLog(interaction, task, eventType) {
+  if (!interaction.guild) return;
+
+  const eventSettings = {
+    assumida: {
+      title: '📌 Tarefa Assumida',
+      color: '#3498DB',
+      actorLabel: 'Assumida por'
+    },
+    cancelada: {
+      title: '🚫 Tarefa Cancelada',
+      color: '#ED4245',
+      actorLabel: 'Cancelada por'
+    },
+    excluida: {
+      title: '🗑️ Tarefa Excluída',
+      color: '#992D22',
+      actorLabel: 'Excluída por'
+    }
+  };
+
+  const settings = eventSettings[eventType];
+  if (!settings) return;
+
+  const eventDate =
+    eventType === 'assumida'
+      ? task.assumed_at
+      : eventType === 'cancelada'
+        ? task.cancelled_at
+        : new Date().toISOString();
+
+  const embed = new EmbedBuilder()
+    .setTitle(settings.title)
+    .setColor(settings.color)
+    .addFields(
+      {
+        name: '🆔 Tarefa',
+        value: `#${task.id} - ${truncateText(task.title, 900)}`,
+        inline: false
+      },
+      {
+        name: '🏢 Empresa',
+        value: truncateText(task.company || 'Não informada', 1024),
+        inline: true
+      },
+      {
+        name: `👤 ${settings.actorLabel}`,
+        value: `<@${interaction.user.id}> (${interaction.user.username})`,
+        inline: true
+      },
+      {
+        name: '🚨 Prioridade',
+        value: getPriorityLabel(task.priority),
+        inline: true
+      },
+      {
+        name: '📅 Data e hora',
+        value: formatDateBR(eventDate),
+        inline: true
+      },
+      {
+        name: '🔔 Avisos enviados',
+        value: String(task.reminder_count || 0),
+        inline: true
+      }
+    )
+    .setTimestamp();
+
+  if (eventType === 'cancelada' && task.assumed_at) {
+    embed.addFields({
+      name: '⏱️ Tempo até o cancelamento',
+      value: formatDuration(task.assumed_at, task.cancelled_at),
+      inline: true
+    });
+  }
+
+  await sendAuditLog(interaction.guild, { embeds: [embed] });
 }
 
 async function sendNewTaskLog(interaction, task) {
@@ -316,11 +549,23 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('config_log')
-    .setDescription('Define o canal de logs e lembretes.')
+    .setDescription('Define o canal privado de auditoria e os cargos autorizados.')
     .addChannelOption(option =>
       option
         .setName('canal')
         .setDescription('Canal onde os logs serão enviados')
+        .setRequired(true)
+    )
+    .addRoleOption(option =>
+      option
+        .setName('cargo_ceo')
+        .setDescription('Cargo CEO autorizado a visualizar os logs')
+        .setRequired(true)
+    )
+    .addRoleOption(option =>
+      option
+        .setName('cargo_adm')
+        .setDescription('Cargo ADM autorizado a visualizar os logs')
         .setRequired(true)
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
@@ -406,13 +651,15 @@ async function checkTaskReminders() {
 
     for (const task of forgottenTasks) {
       const assignedMention = `<@${task.assigned_to_id}>`;
+      const reminderNumber = Number(task.reminder_count || 0) + 1;
+      const taskStart = task.assumed_at || task.updated_at || task.created_at;
 
       const reminderEmbed = new EmbedBuilder()
-        .setTitle('⏰ Lembrete de Tarefa em Andamento')
+        .setTitle(`⏰ Aviso nº ${reminderNumber} • Tarefa em Andamento`)
         .setColor('#FEE75C')
         .setDescription(
           `A tarefa **#${task.id} - ${task.title}** ainda não foi concluída ` +
-          `e está em andamento ${getRelativeTime(task.updated_at)}.`
+          `e está em andamento ${getRelativeTime(taskStart)}.`
         )
         .addFields(
           {
@@ -428,6 +675,21 @@ async function checkTaskReminders() {
           {
             name: '👤 Responsável',
             value: assignedMention,
+            inline: true
+          },
+          {
+            name: '▶️ Início da tarefa',
+            value: formatDateBR(taskStart),
+            inline: true
+          },
+          {
+            name: '⏱️ Tempo total em andamento',
+            value: formatDuration(taskStart),
+            inline: true
+          },
+          {
+            name: '🔔 Número deste aviso',
+            value: String(reminderNumber),
             inline: true
           }
         )
@@ -446,7 +708,8 @@ async function checkTaskReminders() {
             await channel.send({
               content:
                 `🔔 ${assignedMention}, você ainda possui uma tarefa em andamento. ` +
-                'Este é um lembrete para dar continuidade e concluí-la assim que possível.',
+                `Este é o **aviso nº ${reminderNumber}** para dar continuidade e ` +
+                'concluí-la assim que possível.',
               embeds: [reminderEmbed],
               allowedMentions: {
                 users: [task.assigned_to_id]
@@ -484,7 +747,12 @@ async function checkTaskReminders() {
             },
             {
               name: '⏱️ Tempo em andamento',
-              value: getRelativeTime(task.updated_at),
+              value: formatDuration(taskStart),
+              inline: true
+            },
+            {
+              name: '🔔 Número do aviso',
+              value: String(reminderNumber),
               inline: true
             }
           )
@@ -495,7 +763,7 @@ async function checkTaskReminders() {
 
         await assignedUser.send({
           content:
-            '🔔 Olá! Este é um lembrete automático sobre uma tarefa que você assumiu.',
+            `🔔 Olá! Este é o aviso nº ${reminderNumber} sobre uma tarefa que você assumiu.`,
           embeds: [privateReminderEmbed]
         });
       } catch (directMessageError) {
@@ -506,9 +774,14 @@ async function checkTaskReminders() {
       }
 
       // Reinicia a contagem. Se continuar aberta, haverá um novo aviso após 1 hora.
+      const reminderTime = new Date().toISOString();
       const { error: updateError } = await supabase
         .from('tasks')
-        .update({ updated_at: new Date().toISOString() })
+        .update({
+          reminder_count: reminderNumber,
+          last_reminder_at: reminderTime,
+          updated_at: reminderTime
+        })
         .eq('id', task.id);
 
       if (updateError) {
@@ -697,7 +970,11 @@ async function buildTasksEmbed() {
     new ButtonBuilder()
       .setCustomId('btn_atualizar_tarefas')
       .setLabel('🔄 Atualizar')
-      .setStyle(ButtonStyle.Secondary)
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('btn_cancelar_tarefa')
+      .setLabel('🚫 Cancelar')
+      .setStyle(ButtonStyle.Danger)
   );
 
   return { embeds: [embed], components: [row] };
@@ -757,7 +1034,10 @@ async function buildLogEmbed(page = 1) {
         `**[#${task.id}] ${task.title}** (${getPriorityLabel(task.priority)})\n` +
         `🏢 **Empresa:** ${task.company}\n` +
         `👤 **Concluído por:** ${completedBy}\n` +
+        `▶️ **Início:** ${formatDateBR(task.assumed_at || task.created_at)}\n` +
         `📅 **Data de Conclusão:** ${formatDateBR(task.completed_at)}\n` +
+        `⏱️ **Duração:** ${formatDuration(task.assumed_at || task.created_at, task.completed_at)}\n` +
+        `🔔 **Avisos:** ${task.reminder_count || 0}\n` +
         '───────────────────────\n';
     }
 
@@ -790,6 +1070,11 @@ async function buildLogEmbed(page = 1) {
 
 client.on(Events.InteractionCreate, async interaction => {
   try {
+    // Registra comandos, botões, menus e textos enviados nos formulários.
+    void logInteractionAudit(interaction).catch(error => {
+      console.error('Erro ao registrar a interação no LOG:', error.message);
+    });
+
     // -------------------------------------------------------------------------
     // SLASH COMMANDS
     // -------------------------------------------------------------------------
@@ -820,7 +1105,9 @@ client.on(Events.InteractionCreate, async interaction => {
             title: titulo,
             priority: prioridade,
             description: descricao,
-            status: 'pendente'
+            status: 'pendente',
+            created_by_id: interaction.user.id,
+            created_by_name: interaction.user.username
           }])
           .select();
 
@@ -932,6 +1219,8 @@ client.on(Events.InteractionCreate, async interaction => {
           `🗑️ Chamado **#${taskId} - ${data[0].title}** da empresa ` +
           `**${data[0].company}** foi excluído com sucesso!`
         );
+
+        await sendTaskLifecycleLog(interaction, data[0], 'excluida');
         return;
       }
 
@@ -945,6 +1234,59 @@ client.on(Events.InteractionCreate, async interaction => {
       if (commandName === 'config_log') {
         await interaction.deferReply({ flags: 64 });
         const channel = interaction.options.getChannel('canal');
+        const ceoRole = interaction.options.getRole('cargo_ceo');
+        const admRole = interaction.options.getRole('cargo_adm');
+
+        if (!channel.permissionOverwrites) {
+          await interaction.editReply(
+            '❌ Selecione um canal de texto comum que permita configurar permissões.'
+          );
+          return;
+        }
+
+        try {
+          await channel.permissionOverwrites.set(
+            [
+              {
+                id: interaction.guild.roles.everyone.id,
+                deny: [PermissionFlagsBits.ViewChannel]
+              },
+              {
+                id: ceoRole.id,
+                allow: [
+                  PermissionFlagsBits.ViewChannel,
+                  PermissionFlagsBits.SendMessages,
+                  PermissionFlagsBits.ReadMessageHistory
+                ]
+              },
+              {
+                id: admRole.id,
+                allow: [
+                  PermissionFlagsBits.ViewChannel,
+                  PermissionFlagsBits.SendMessages,
+                  PermissionFlagsBits.ReadMessageHistory
+                ]
+              },
+              {
+                id: client.user.id,
+                allow: [
+                  PermissionFlagsBits.ViewChannel,
+                  PermissionFlagsBits.SendMessages,
+                  PermissionFlagsBits.ReadMessageHistory,
+                  PermissionFlagsBits.EmbedLinks,
+                  PermissionFlagsBits.AttachFiles
+                ]
+              }
+            ],
+            'Canal privado de auditoria: acesso para CEO, ADM e o bot.'
+          );
+        } catch (permissionError) {
+          console.error('Erro ao proteger o canal de LOG:', permissionError);
+          await interaction.editReply(
+            '❌ Não consegui proteger o canal. Dê ao bot a permissão **Gerenciar canais** e tente novamente.'
+          );
+          return;
+        }
 
         const { error } = await supabase
           .from('log_settings')
@@ -959,11 +1301,39 @@ client.on(Events.InteractionCreate, async interaction => {
           return;
         }
 
+        logChannelCache.set(interaction.guildId, channel.id);
+
         await interaction.editReply(
-          `✅ Canal de logs e lembretes definido para: ${channel}`
+          `✅ Canal de auditoria definido para ${channel}. Somente ${ceoRole}, ` +
+          `${admRole}, administradores do servidor e o bot poderão visualizá-lo.`
         );
+
+        const configEmbed = new EmbedBuilder()
+          .setTitle('🔐 Canal de Auditoria Configurado')
+          .setColor('#57F287')
+          .addFields(
+            {
+              name: '👤 Configurado por',
+              value: `<@${interaction.user.id}> (${interaction.user.username})`,
+              inline: false
+            },
+            {
+              name: '👑 Cargo CEO',
+              value: `${ceoRole}`,
+              inline: true
+            },
+            {
+              name: '🛡️ Cargo ADM',
+              value: `${admRole}`,
+              inline: true
+            }
+          )
+          .setTimestamp();
+
+        await sendAuditLog(interaction.guild, { embeds: [configEmbed] });
         return;
       }
+
     }
 
     // -------------------------------------------------------------------------
@@ -1104,6 +1474,45 @@ client.on(Events.InteractionCreate, async interaction => {
         return;
       }
 
+      if (customId === 'btn_cancelar_tarefa') {
+        await interaction.deferReply({ flags: 64 });
+
+        const { data: tasks, error } = await supabase
+          .from('tasks')
+          .select('*')
+          .in('status', ['pendente', 'em_andamento'])
+          .order('id', { ascending: false })
+          .limit(25);
+
+        if (error) {
+          console.error('Erro ao buscar tarefas para cancelar:', error);
+          await interaction.editReply(
+            `❌ Erro ao buscar tarefas: \`${error.message}\``
+          );
+          return;
+        }
+
+        if (!tasks || tasks.length === 0) {
+          await interaction.editReply('❌ Não há tarefas abertas para cancelar.');
+          return;
+        }
+
+        const selectMenu = new StringSelectMenuBuilder()
+          .setCustomId('select_cancelar_tarefa')
+          .setPlaceholder('Selecione uma tarefa para cancelar...')
+          .addOptions(tasks.map(task => ({
+            label: `#${task.id} - ${task.title}`.slice(0, 100),
+            description: `Empresa: ${task.company}`.slice(0, 100),
+            value: String(task.id)
+          })));
+
+        await interaction.editReply({
+          content: '🚫 Escolha a tarefa que deseja cancelar:',
+          components: [new ActionRowBuilder().addComponents(selectMenu)]
+        });
+        return;
+      }
+
       if (customId.startsWith('log_page_')) {
         const page = parseInt(customId.split('_')[2], 10) || 1;
         await interaction.deferUpdate();
@@ -1128,6 +1537,7 @@ client.on(Events.InteractionCreate, async interaction => {
       if (interaction.customId === 'select_assumir_tarefa') {
         await interaction.deferUpdate();
         const taskId = interaction.values[0];
+        const assumedAt = new Date().toISOString();
 
         const { data, error } = await supabase
           .from('tasks')
@@ -1135,9 +1545,13 @@ client.on(Events.InteractionCreate, async interaction => {
             status: 'em_andamento',
             assigned_to_id: interaction.user.id,
             assigned_to_name: interaction.user.username,
-            updated_at: new Date().toISOString()
+            assumed_at: assumedAt,
+            reminder_count: 0,
+            last_reminder_at: null,
+            updated_at: assumedAt
           })
           .eq('id', taskId)
+          .in('status', ['pendente', 'em_andamento'])
           .select();
 
         if (error || !data || data.length === 0) {
@@ -1155,6 +1569,8 @@ client.on(Events.InteractionCreate, async interaction => {
             `**${data[0].company}**!`,
           components: []
         });
+
+        await sendTaskLifecycleLog(interaction, data[0], 'assumida');
         return;
       }
 
@@ -1173,6 +1589,7 @@ client.on(Events.InteractionCreate, async interaction => {
             updated_at: now
           })
           .eq('id', taskId)
+          .in('status', ['pendente', 'em_andamento'])
           .select();
 
         if (error || !data || data.length === 0) {
@@ -1236,12 +1653,35 @@ client.on(Events.InteractionCreate, async interaction => {
                     inline: false
                   },
                   {
-                    name: '📅 Data/Hora',
+                    name: '▶️ Início',
+                    value: formatDateBR(task.assumed_at || task.created_at),
+                    inline: true
+                  },
+                  {
+                    name: '✅ Conclusão',
                     value: formatDateBR(now),
-                    inline: false
+                    inline: true
+                  },
+                  {
+                    name: '⏱️ Tempo para concluir',
+                    value: formatDuration(task.assumed_at || task.created_at, now),
+                    inline: true
+                  },
+                  {
+                    name: '🔔 Avisos necessários',
+                    value: String(task.reminder_count || 0),
+                    inline: true
                   }
                 )
                 .setTimestamp();
+
+              if (task.last_reminder_at) {
+                logEmbed.addFields({
+                  name: '🔔 Último aviso enviado',
+                  value: formatDateBR(task.last_reminder_at),
+                  inline: true
+                });
+              }
 
               if (logo) logEmbed.setThumbnail(logo);
               await channel.send({ embeds: [logEmbed] });
@@ -1251,6 +1691,46 @@ client.on(Events.InteractionCreate, async interaction => {
           }
         }
 
+        return;
+      }
+
+      if (interaction.customId === 'select_cancelar_tarefa') {
+        await interaction.deferUpdate();
+        const taskId = interaction.values[0];
+        const cancelledAt = new Date().toISOString();
+
+        const { data, error } = await supabase
+          .from('tasks')
+          .update({
+            status: 'cancelada',
+            cancelled_by_id: interaction.user.id,
+            cancelled_by_name: interaction.user.username,
+            cancelled_at: cancelledAt,
+            updated_at: cancelledAt
+          })
+          .eq('id', taskId)
+          .in('status', ['pendente', 'em_andamento'])
+          .select();
+
+        if (error || !data || data.length === 0) {
+          await interaction.editReply({
+            content:
+              `❌ Erro ao cancelar tarefa: \`${error?.message || 'Tarefa não encontrada ou já finalizada'}\``,
+            components: []
+          });
+          return;
+        }
+
+        const task = data[0];
+
+        await interaction.editReply({
+          content:
+            `🚫 A tarefa **#${task.id} - ${task.title}** da empresa ` +
+            `**${task.company}** foi cancelada.`,
+          components: []
+        });
+
+        await sendTaskLifecycleLog(interaction, task, 'cancelada');
         return;
       }
     }
@@ -1286,7 +1766,9 @@ client.on(Events.InteractionCreate, async interaction => {
           title: titulo,
           priority: prioridade,
           description: descricao,
-          status: 'pendente'
+          status: 'pendente',
+          created_by_id: interaction.user.id,
+          created_by_name: interaction.user.username
         }])
         .select();
 
@@ -1324,6 +1806,218 @@ client.on(Events.InteractionCreate, async interaction => {
     } catch (replyError) {
       console.error('Não foi possível responder ao erro:', replyError.message);
     }
+  }
+});
+
+// -----------------------------------------------------------------------------
+// AUDITORIA DE MENSAGENS DO SERVIDOR
+// -----------------------------------------------------------------------------
+
+client.on(Events.MessageCreate, async message => {
+  try {
+    if (!message.guild || message.author?.bot) return;
+
+    const logChannel = await getConfiguredLogChannel(message.guild);
+    if (!logChannel || message.channelId === logChannel.id) return;
+
+    const attachments = message.attachments
+      .map(attachment => `[${attachment.name || 'arquivo'}](${attachment.url})`)
+      .join('\n');
+
+    const embed = new EmbedBuilder()
+      .setTitle('💬 Mensagem Enviada')
+      .setColor('#5865F2')
+      .addFields(
+        {
+          name: '👤 Autor',
+          value: `<@${message.author.id}> (${message.author.username})`,
+          inline: true
+        },
+        {
+          name: '📍 Canal',
+          value: `<#${message.channelId}>`,
+          inline: true
+        },
+        {
+          name: '🆔 ID da mensagem',
+          value: message.id,
+          inline: true
+        },
+        {
+          name: '📝 Conteúdo',
+          value: truncateText(message.content || '*Mensagem sem texto*', 1024),
+          inline: false
+        }
+      )
+      .setTimestamp();
+
+    if (attachments) {
+      embed.addFields({
+        name: '📎 Anexos',
+        value: truncateText(attachments, 1024),
+        inline: false
+      });
+    }
+
+    await logChannel.send({ embeds: [embed] });
+  } catch (error) {
+    console.error('Erro ao registrar mensagem enviada:', error.message);
+  }
+});
+
+client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
+  try {
+    if (newMessage.partial) {
+      try {
+        await newMessage.fetch();
+      } catch {
+        // O conteúdo posterior poderá continuar indisponível.
+      }
+    }
+
+    if (!newMessage.guild || newMessage.author?.bot) return;
+    if (oldMessage.content === newMessage.content) return;
+
+    const logChannel = await getConfiguredLogChannel(newMessage.guild);
+    if (!logChannel || newMessage.channelId === logChannel.id) return;
+
+    const embed = new EmbedBuilder()
+      .setTitle('✏️ Mensagem Editada')
+      .setColor('#FEE75C')
+      .addFields(
+        {
+          name: '👤 Autor',
+          value: newMessage.author
+            ? `<@${newMessage.author.id}> (${newMessage.author.username})`
+            : 'Autor não disponível',
+          inline: true
+        },
+        {
+          name: '📍 Canal',
+          value: `<#${newMessage.channelId}>`,
+          inline: true
+        },
+        {
+          name: '🆔 ID da mensagem',
+          value: newMessage.id,
+          inline: true
+        },
+        {
+          name: '📄 Antes',
+          value: truncateText(oldMessage.content || '*Conteúdo anterior indisponível*', 1024),
+          inline: false
+        },
+        {
+          name: '📝 Depois',
+          value: truncateText(newMessage.content || '*Mensagem sem texto*', 1024),
+          inline: false
+        }
+      )
+      .setTimestamp();
+
+    await logChannel.send({ embeds: [embed] });
+  } catch (error) {
+    console.error('Erro ao registrar mensagem editada:', error.message);
+  }
+});
+
+client.on(Events.MessageDelete, async message => {
+  try {
+    if (!message.guild || message.author?.bot) return;
+
+    const logChannel = await getConfiguredLogChannel(message.guild);
+    if (!logChannel || message.channelId === logChannel.id) return;
+
+    const attachments = message.attachments
+      ?.map(attachment => attachment.url)
+      .join('\n');
+
+    const embed = new EmbedBuilder()
+      .setTitle('🗑️ Mensagem Apagada')
+      .setColor('#ED4245')
+      .addFields(
+        {
+          name: '👤 Autor',
+          value: message.author
+            ? `<@${message.author.id}> (${message.author.username})`
+            : 'Autor não disponível',
+          inline: true
+        },
+        {
+          name: '📍 Canal',
+          value: `<#${message.channelId}>`,
+          inline: true
+        },
+        {
+          name: '🆔 ID da mensagem',
+          value: message.id,
+          inline: true
+        },
+        {
+          name: '📝 Conteúdo apagado',
+          value: truncateText(
+            message.content || '*Conteúdo indisponível: a mensagem não estava no cache do bot.*',
+            1024
+          ),
+          inline: false
+        }
+      )
+      .setTimestamp();
+
+    if (attachments) {
+      embed.addFields({
+        name: '📎 Anexos apagados',
+        value: truncateText(attachments, 1024),
+        inline: false
+      });
+    }
+
+    await logChannel.send({ embeds: [embed] });
+  } catch (error) {
+    console.error('Erro ao registrar mensagem apagada:', error.message);
+  }
+});
+
+client.on(Events.MessageBulkDelete, async messages => {
+  try {
+    const firstMessage = messages.first();
+    if (!firstMessage?.guild) return;
+
+    const logChannel = await getConfiguredLogChannel(firstMessage.guild);
+    if (!logChannel || firstMessage.channelId === logChannel.id) return;
+
+    const summary = messages
+      .first(20)
+      .map(message => {
+        const author = message.author
+          ? `${message.author.username} (${message.author.id})`
+          : 'Autor desconhecido';
+        const content = truncateText(message.content || 'Conteúdo indisponível', 120);
+        return `• **${author}:** ${content}`;
+      })
+      .join('\n');
+
+    const embed = new EmbedBuilder()
+      .setTitle('🗑️ Mensagens Apagadas em Massa')
+      .setColor('#992D22')
+      .setDescription(truncateText(summary || 'Sem conteúdo disponível.', 4096))
+      .addFields(
+        {
+          name: '📍 Canal',
+          value: `<#${firstMessage.channelId}>`,
+          inline: true
+        },
+        {
+          name: '🔢 Quantidade',
+          value: String(messages.size),
+          inline: true
+        }
+      )
+      .setTimestamp();
+
+    await logChannel.send({ embeds: [embed] });
+  } catch (error) {
+    console.error('Erro ao registrar exclusão em massa:', error.message);
   }
 });
 
