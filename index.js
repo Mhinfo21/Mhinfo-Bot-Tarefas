@@ -141,6 +141,112 @@ function getPriorityVisual(priority) {
   return priorities[priority || 'media'] || priorities.media;
 }
 
+async function sendNewTaskLog(interaction, task) {
+  if (!interaction.guildId || !interaction.guild) return;
+
+  const { data: logSetting, error: logSettingError } = await supabase
+    .from('log_settings')
+    .select('log_channel_id')
+    .eq('guild_id', interaction.guildId)
+    .maybeSingle();
+
+  if (logSettingError) {
+    console.error('Erro ao buscar o canal de LOG da nova tarefa:', logSettingError);
+    return;
+  }
+
+  if (!logSetting?.log_channel_id) {
+    console.log(
+      `ℹ️ Tarefa #${task.id} criada, mas não existe canal de LOG configurado neste servidor.`
+    );
+    return;
+  }
+
+  try {
+    const channel = await interaction.guild.channels.fetch(
+      logSetting.log_channel_id
+    );
+
+    if (!channel || !channel.isTextBased()) {
+      console.error('O canal configurado para LOG não é um canal de texto válido.');
+      return;
+    }
+
+    const creatorName =
+      interaction.member?.displayName ||
+      interaction.user.globalName ||
+      interaction.user.username;
+    const logo = getBotLogo();
+    const priorityColors = {
+      urgente: '#ED4245',
+      media: '#FEE75C',
+      baixa: '#57F287'
+    };
+
+    const newTaskEmbed = new EmbedBuilder()
+      .setTitle('🆕 Nova Tarefa Criada!')
+      .setColor(priorityColors[task.priority] || '#0099FF')
+      .setDescription('Uma nova tarefa foi registrada na Central de Tarefas MH INFO.')
+      .addFields(
+        {
+          name: '👤 Criada por',
+          value: `<@${interaction.user.id}> (${truncateText(creatorName, 80)})`,
+          inline: true
+        },
+        {
+          name: '🏢 Empresa',
+          value: truncateText(task.company || 'Não informada', 1024),
+          inline: true
+        },
+        {
+          name: '🆔 ID da Tarefa',
+          value: `#${task.id}`,
+          inline: true
+        },
+        {
+          name: '📝 Título',
+          value: truncateText(task.title || 'Sem título', 1024),
+          inline: false
+        },
+        {
+          name: '🛠️ Problema / Descrição',
+          value: truncateText(task.description || 'Sem descrição adicional', 1024),
+          inline: false
+        },
+        {
+          name: '🚨 Urgência',
+          value: getPriorityLabel(task.priority),
+          inline: true
+        },
+        {
+          name: '📅 Data e hora',
+          value: formatDateBR(task.created_at || new Date().toISOString()),
+          inline: true
+        }
+      )
+      .setFooter({
+        text: 'MH INFO • Registro automático de tarefas',
+        iconURL: logo || undefined
+      })
+      .setTimestamp();
+
+    if (logo) newTaskEmbed.setThumbnail(logo);
+
+    await channel.send({
+      content: `🆕 <@${interaction.user.id}> criou uma nova tarefa!`,
+      embeds: [newTaskEmbed],
+      allowedMentions: {
+        users: [interaction.user.id]
+      }
+    });
+  } catch (sendError) {
+    console.error(
+      `Não foi possível enviar o LOG da criação da tarefa #${task.id}:`,
+      sendError.message
+    );
+  }
+}
+
 // -----------------------------------------------------------------------------
 // SLASH COMMANDS
 // -----------------------------------------------------------------------------
@@ -732,6 +838,8 @@ client.on(Events.InteractionCreate, async interaction => {
           `**${task.company}** (${getPriorityLabel(task.priority)}) criado com sucesso! ` +
           'Use `/tarefas` para visualizar.'
         );
+
+        await sendNewTaskLog(interaction, task);
         return;
       }
 
@@ -1195,6 +1303,8 @@ client.on(Events.InteractionCreate, async interaction => {
         `✅ Chamado **#${task.id} - ${task.title}** para a empresa ` +
         `**${task.company}** (${getPriorityLabel(task.priority)}) criado com sucesso!`
       );
+
+      await sendNewTaskLog(interaction, task);
     }
   } catch (error) {
     console.error('Erro no tratamento da interação:', error);
