@@ -171,6 +171,27 @@ function formatDuration(startDate, endDate = new Date().toISOString()) {
   return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
 }
 
+function formatSecondsDuration(totalSecondsValue) {
+  const totalSeconds = Math.max(0, Number(totalSecondsValue || 0));
+  const totalMinutes = Math.floor(totalSeconds / 60);
+
+  if (totalSeconds < 60) return `${Math.floor(totalSeconds)}s`;
+  if (totalMinutes < 60) return `${totalMinutes}min`;
+
+  const totalHours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+
+  if (totalHours < 24) {
+    return minutes > 0
+      ? `${totalHours}h ${minutes}min`
+      : `${totalHours}h`;
+  }
+
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+}
+
 const logChannelCache = new Map();
 
 async function getConfiguredLogChannel(guild) {
@@ -309,6 +330,16 @@ async function sendTaskLifecycleLog(interaction, task, eventType) {
       color: '#ED4245',
       actorLabel: 'Cancelada por'
     },
+    pausada: {
+      title: '⏸️ Tarefa Pausada',
+      color: '#FEE75C',
+      actorLabel: 'Pausada por'
+    },
+    retomada: {
+      title: '▶️ Tarefa Retomada',
+      color: '#57F287',
+      actorLabel: 'Retomada por'
+    },
     excluida: {
       title: '🗑️ Tarefa Excluída',
       color: '#992D22',
@@ -324,7 +355,11 @@ async function sendTaskLifecycleLog(interaction, task, eventType) {
       ? task.assumed_at
       : eventType === 'cancelada'
         ? task.cancelled_at
-        : new Date().toISOString();
+        : eventType === 'pausada'
+          ? task.paused_at
+          : eventType === 'retomada'
+            ? task.resumed_at
+            : new Date().toISOString();
 
   const embed = new EmbedBuilder()
     .setTitle(settings.title)
@@ -369,6 +404,41 @@ async function sendTaskLifecycleLog(interaction, task, eventType) {
       value: formatDuration(task.assumed_at, task.cancelled_at),
       inline: true
     });
+  }
+
+  if (eventType === 'pausada') {
+    embed.addFields(
+      {
+        name: '📝 Motivo da pausa',
+        value: truncateText(task.pause_reason || 'Não informado', 1024),
+        inline: false
+      },
+      {
+        name: '🔢 Número da pausa',
+        value: String(task.pause_count || 1),
+        inline: true
+      }
+    );
+  }
+
+  if (eventType === 'retomada') {
+    embed.addFields(
+      {
+        name: '⏸️ Duração desta pausa',
+        value: formatDuration(task.paused_at, task.resumed_at),
+        inline: true
+      },
+      {
+        name: '⏱️ Tempo total pausado',
+        value: formatSecondsDuration(task.total_paused_seconds),
+        inline: true
+      },
+      {
+        name: '📝 Último motivo',
+        value: truncateText(task.pause_reason || 'Não informado', 1024),
+        inline: false
+      }
+    );
   }
 
   await sendAuditLog(interaction.guild, { embeds: [embed] });
@@ -806,7 +876,7 @@ async function buildTasksEmbed() {
   const { data: activeTasks, error: activeError } = await supabase
     .from('tasks')
     .select('*')
-    .in('status', ['pendente', 'em_andamento'])
+    .in('status', ['pendente', 'em_andamento', 'pausada'])
     .order('created_at', { ascending: false });
 
   const twentyFourHoursAgo = new Date(
@@ -828,6 +898,7 @@ async function buildTasksEmbed() {
   const completed = recentCompleted || [];
   const pendingCount = tasks.filter(task => task.status === 'pendente').length;
   const progressCount = tasks.filter(task => task.status === 'em_andamento').length;
+  const pausedCount = tasks.filter(task => task.status === 'pausada').length;
   const urgentCount = tasks.filter(task => task.priority === 'urgente').length;
   const logo = getBotLogo();
 
@@ -835,7 +906,8 @@ async function buildTasksEmbed() {
     '**Tecnologia • Suporte • Infraestrutura**\n\n' +
     '## 🔵 TAREFAS EM ANDAMENTO\n' +
     `*${tasks.length} ${tasks.length === 1 ? 'chamado ativo' : 'chamados ativos'} no momento*\n\n` +
-    `🔴 Urgentes: **${urgentCount}**  •  🟠 Pendentes: **${pendingCount}**  •  🔵 Em andamento: **${progressCount}**`;
+    `🔴 Urgentes: **${urgentCount}**  •  🟠 Pendentes: **${pendingCount}**  •  ` +
+    `🔵 Em andamento: **${progressCount}**  •  ⏸️ Pausadas: **${pausedCount}**`;
 
   const embed = new EmbedBuilder()
     .setColor('#0099FF')
@@ -877,7 +949,13 @@ async function buildTasksEmbed() {
 
       const status = task.status === 'em_andamento'
         ? '🔵 **Em andamento**'
-        : '🟠 **Pendente**';
+        : task.status === 'pausada'
+          ? '⏸️ **Pausada**'
+          : '🟠 **Pendente**';
+
+      const pauseInfo = task.status === 'pausada'
+        ? `\n📝 Motivo da pausa: ${truncateText(task.pause_reason || 'Não informado', 120)}`
+        : '';
 
       const description = task.description &&
         task.description !== 'Sem descrição adicional'
@@ -889,7 +967,7 @@ async function buildTasksEmbed() {
         `📝 **${truncateText(task.title || 'Tarefa sem título', 160)}**${description}\n\n` +
         `👤 Responsável: ${assigned}\n` +
         `🚨 Prioridade: ${getPriorityVisual(task.priority)}\n` +
-        `⏱️ Status: ${status}\n` +
+        `⏱️ Status: ${status}${pauseInfo}\n` +
         '━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
         700
       );
@@ -977,7 +1055,18 @@ async function buildTasksEmbed() {
       .setStyle(ButtonStyle.Danger)
   );
 
-  return { embeds: [embed], components: [row] };
+  const pauseRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId('btn_pausar_tarefa')
+      .setLabel('⏸️ Pausar')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder()
+      .setCustomId('btn_retomar_tarefa')
+      .setLabel('▶️ Retomar')
+      .setStyle(ButtonStyle.Success)
+  );
+
+  return { embeds: [embed], components: [row, pauseRow] };
 }
 
 // -----------------------------------------------------------------------------
@@ -1037,6 +1126,7 @@ async function buildLogEmbed(page = 1) {
         `▶️ **Início:** ${formatDateBR(task.assumed_at || task.created_at)}\n` +
         `📅 **Data de Conclusão:** ${formatDateBR(task.completed_at)}\n` +
         `⏱️ **Duração:** ${formatDuration(task.assumed_at || task.created_at, task.completed_at)}\n` +
+        `⏸️ **Pausas:** ${task.pause_count || 0} (${formatSecondsDuration(task.total_paused_seconds)})\n` +
         `🔔 **Avisos:** ${task.reminder_count || 0}\n` +
         '───────────────────────\n';
     }
@@ -1138,7 +1228,7 @@ client.on(Events.InteractionCreate, async interaction => {
           .from('tasks')
           .select('*')
           .ilike('company', `%${nomeEmpresa}%`)
-          .in('status', ['pendente', 'em_andamento'])
+          .in('status', ['pendente', 'em_andamento', 'pausada'])
           .order('id', { ascending: false });
 
         if (error) {
@@ -1171,15 +1261,21 @@ client.on(Events.InteractionCreate, async interaction => {
           for (const task of companyTasks) {
             const status = task.status === 'em_andamento'
               ? '⏳ [EM ANDAMENTO]'
-              : '🔴 [PENDENTE]';
+              : task.status === 'pausada'
+                ? '⏸️ [PAUSADA]'
+                : '🔴 [PENDENTE]';
             const assigned = task.assigned_to_id
               ? `<@${task.assigned_to_id}>`
               : '*Ninguém*';
+            const pauseReason = task.status === 'pausada'
+              ? `Motivo da pausa: ${truncateText(task.pause_reason || 'Não informado', 250)}\n`
+              : '';
 
             content +=
               `**#${task.id} - ${task.title}**\n` +
               `Status: ${status} | Prioridade: ${getPriorityLabel(task.priority)}\n` +
               `Responsável: ${assigned}\n` +
+              pauseReason +
               '───────────────────────\n';
           }
 
@@ -1474,13 +1570,98 @@ client.on(Events.InteractionCreate, async interaction => {
         return;
       }
 
+      if (customId === 'btn_pausar_tarefa') {
+        await interaction.deferReply({ flags: 64 });
+
+        const { data: tasks, error } = await supabase
+          .from('tasks')
+          .select('*')
+          .eq('status', 'em_andamento')
+          .eq('assigned_to_id', interaction.user.id)
+          .order('id', { ascending: false })
+          .limit(25);
+
+        if (error) {
+          console.error('Erro ao buscar tarefas para pausar:', error);
+          await interaction.editReply(
+            `❌ Erro ao buscar tarefas: \`${error.message}\``
+          );
+          return;
+        }
+
+        if (!tasks || tasks.length === 0) {
+          await interaction.editReply(
+            '❌ Você não possui nenhuma tarefa em andamento para pausar.'
+          );
+          return;
+        }
+
+        const selectMenu = new StringSelectMenuBuilder()
+          .setCustomId('select_pausar_tarefa')
+          .setPlaceholder('Selecione a tarefa que deseja pausar...')
+          .addOptions(tasks.map(task => ({
+            label: `#${task.id} - ${task.title}`.slice(0, 100),
+            description: `Empresa: ${task.company}`.slice(0, 100),
+            value: String(task.id)
+          })));
+
+        await interaction.editReply({
+          content: '⏸️ Escolha a tarefa que deseja pausar:',
+          components: [new ActionRowBuilder().addComponents(selectMenu)]
+        });
+        return;
+      }
+
+      if (customId === 'btn_retomar_tarefa') {
+        await interaction.deferReply({ flags: 64 });
+
+        const { data: tasks, error } = await supabase
+          .from('tasks')
+          .select('*')
+          .eq('status', 'pausada')
+          .eq('assigned_to_id', interaction.user.id)
+          .order('id', { ascending: false })
+          .limit(25);
+
+        if (error) {
+          console.error('Erro ao buscar tarefas pausadas:', error);
+          await interaction.editReply(
+            `❌ Erro ao buscar tarefas: \`${error.message}\``
+          );
+          return;
+        }
+
+        if (!tasks || tasks.length === 0) {
+          await interaction.editReply(
+            '❌ Você não possui nenhuma tarefa pausada para retomar.'
+          );
+          return;
+        }
+
+        const selectMenu = new StringSelectMenuBuilder()
+          .setCustomId('select_retomar_tarefa')
+          .setPlaceholder('Selecione a tarefa que deseja retomar...')
+          .addOptions(tasks.map(task => ({
+            label: `#${task.id} - ${task.title}`.slice(0, 100),
+            description:
+              `Motivo: ${task.pause_reason || 'Não informado'}`.slice(0, 100),
+            value: String(task.id)
+          })));
+
+        await interaction.editReply({
+          content: '▶️ Escolha a tarefa que deseja retomar:',
+          components: [new ActionRowBuilder().addComponents(selectMenu)]
+        });
+        return;
+      }
+
       if (customId === 'btn_cancelar_tarefa') {
         await interaction.deferReply({ flags: 64 });
 
         const { data: tasks, error } = await supabase
           .from('tasks')
           .select('*')
-          .in('status', ['pendente', 'em_andamento'])
+          .in('status', ['pendente', 'em_andamento', 'pausada'])
           .order('id', { ascending: false })
           .limit(25);
 
@@ -1534,6 +1715,97 @@ client.on(Events.InteractionCreate, async interaction => {
     // -------------------------------------------------------------------------
 
     if (interaction.isStringSelectMenu()) {
+      if (interaction.customId === 'select_pausar_tarefa') {
+        const taskId = interaction.values[0];
+        const modal = new ModalBuilder()
+          .setCustomId(`modal_pausar_tarefa_${taskId}`)
+          .setTitle('⏸️ Pausar Tarefa');
+
+        const inputMotivo = new TextInputBuilder()
+          .setCustomId('input_motivo_pausa')
+          .setLabel('Motivo da pausa')
+          .setStyle(TextInputStyle.Paragraph)
+          .setPlaceholder('Ex: aguardando retorno do cliente ou chegada de uma peça')
+          .setRequired(true)
+          .setMaxLength(1000);
+
+        modal.addComponents(
+          new ActionRowBuilder().addComponents(inputMotivo)
+        );
+
+        await interaction.showModal(modal);
+        return;
+      }
+
+      if (interaction.customId === 'select_retomar_tarefa') {
+        await interaction.deferUpdate();
+        const taskId = interaction.values[0];
+
+        const { data: currentTask, error: fetchError } = await supabase
+          .from('tasks')
+          .select('*')
+          .eq('id', taskId)
+          .eq('status', 'pausada')
+          .eq('assigned_to_id', interaction.user.id)
+          .maybeSingle();
+
+        if (fetchError || !currentTask) {
+          await interaction.editReply({
+            content:
+              `❌ Não foi possível retomar a tarefa: \`${fetchError?.message || 'ela não está pausada ou não pertence a você'}\``,
+            components: []
+          });
+          return;
+        }
+
+        const resumedAt = new Date().toISOString();
+        const currentPauseSeconds = currentTask.paused_at
+          ? Math.max(
+              0,
+              Math.floor(
+                (new Date(resumedAt).getTime() - new Date(currentTask.paused_at).getTime()) /
+                1000
+              )
+            )
+          : 0;
+        const totalPausedSeconds =
+          Number(currentTask.total_paused_seconds || 0) + currentPauseSeconds;
+
+        const { data, error } = await supabase
+          .from('tasks')
+          .update({
+            status: 'em_andamento',
+            resumed_at: resumedAt,
+            total_paused_seconds: totalPausedSeconds,
+            updated_at: resumedAt
+          })
+          .eq('id', taskId)
+          .eq('status', 'pausada')
+          .eq('assigned_to_id', interaction.user.id)
+          .select();
+
+        if (error || !data || data.length === 0) {
+          await interaction.editReply({
+            content:
+              `❌ Erro ao retomar tarefa: \`${error?.message || 'a tarefa já foi alterada'}\``,
+            components: []
+          });
+          return;
+        }
+
+        const task = data[0];
+
+        await interaction.editReply({
+          content:
+            `▶️ A tarefa **#${task.id} - ${task.title}** foi retomada. ` +
+            'O prazo do próximo lembrete começou novamente agora.',
+          components: []
+        });
+
+        await sendTaskLifecycleLog(interaction, task, 'retomada');
+        return;
+      }
+
       if (interaction.customId === 'select_assumir_tarefa') {
         await interaction.deferUpdate();
         const taskId = interaction.values[0];
@@ -1602,6 +1874,19 @@ client.on(Events.InteractionCreate, async interaction => {
         }
 
         const task = data[0];
+        const completionPausedSeconds = Number(task.total_paused_seconds || 0);
+        const completionElapsedSeconds = Math.max(
+          0,
+          Math.floor(
+            (new Date(now).getTime() -
+              new Date(task.assumed_at || task.created_at).getTime()) /
+              1000
+          )
+        );
+        const effectiveWorkSeconds = Math.max(
+          0,
+          completionElapsedSeconds - completionPausedSeconds
+        );
 
         await interaction.editReply({
           content:
@@ -1671,6 +1956,21 @@ client.on(Events.InteractionCreate, async interaction => {
                     name: '🔔 Avisos necessários',
                     value: String(task.reminder_count || 0),
                     inline: true
+                  },
+                  {
+                    name: '⏸️ Quantidade de pausas',
+                    value: String(task.pause_count || 0),
+                    inline: true
+                  },
+                  {
+                    name: '⏱️ Tempo total pausado',
+                    value: formatSecondsDuration(completionPausedSeconds),
+                    inline: true
+                  },
+                  {
+                    name: '🛠️ Tempo efetivo de trabalho',
+                    value: formatSecondsDuration(effectiveWorkSeconds),
+                    inline: true
                   }
                 )
                 .setTimestamp();
@@ -1709,7 +2009,7 @@ client.on(Events.InteractionCreate, async interaction => {
             updated_at: cancelledAt
           })
           .eq('id', taskId)
-          .in('status', ['pendente', 'em_andamento'])
+          .in('status', ['pendente', 'em_andamento', 'pausada'])
           .select();
 
         if (error || !data || data.length === 0) {
@@ -1736,8 +2036,71 @@ client.on(Events.InteractionCreate, async interaction => {
     }
 
     // -------------------------------------------------------------------------
-    // MODAL DE NOVA TAREFA
+    // MODAIS
     // -------------------------------------------------------------------------
+
+    if (
+      interaction.isModalSubmit() &&
+      interaction.customId.startsWith('modal_pausar_tarefa_')
+    ) {
+      await interaction.deferReply({ flags: 64 });
+
+      const taskId = interaction.customId.replace('modal_pausar_tarefa_', '');
+      const pauseReason = interaction.fields
+        .getTextInputValue('input_motivo_pausa')
+        .trim();
+
+      const { data: currentTask, error: fetchError } = await supabase
+        .from('tasks')
+        .select('*')
+        .eq('id', taskId)
+        .eq('status', 'em_andamento')
+        .eq('assigned_to_id', interaction.user.id)
+        .maybeSingle();
+
+      if (fetchError || !currentTask) {
+        await interaction.editReply(
+          `❌ Não foi possível pausar a tarefa: \`${fetchError?.message || 'ela não está em andamento ou não pertence a você'}\``
+        );
+        return;
+      }
+
+      const pausedAt = new Date().toISOString();
+      const pauseCount = Number(currentTask.pause_count || 0) + 1;
+
+      const { data, error } = await supabase
+        .from('tasks')
+        .update({
+          status: 'pausada',
+          paused_at: pausedAt,
+          paused_by_id: interaction.user.id,
+          paused_by_name: interaction.user.username,
+          pause_reason: pauseReason,
+          pause_count: pauseCount,
+          updated_at: pausedAt
+        })
+        .eq('id', taskId)
+        .eq('status', 'em_andamento')
+        .eq('assigned_to_id', interaction.user.id)
+        .select();
+
+      if (error || !data || data.length === 0) {
+        await interaction.editReply(
+          `❌ Erro ao pausar tarefa: \`${error?.message || 'a tarefa já foi alterada'}\``
+        );
+        return;
+      }
+
+      const task = data[0];
+
+      await interaction.editReply(
+        `⏸️ A tarefa **#${task.id} - ${task.title}** foi pausada. ` +
+        'Os lembretes ficam suspensos até você retomá-la.'
+      );
+
+      await sendTaskLifecycleLog(interaction, task, 'pausada');
+      return;
+    }
 
     if (
       interaction.isModalSubmit() &&
