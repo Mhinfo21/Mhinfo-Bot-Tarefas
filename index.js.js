@@ -2,46 +2,6 @@
  * ==============================================================================
  * 🤖 BOT DE GERENCIAMENTO DE TAREFAS / CHAMADOS (DISCORD.JS V14 + SUPABASE)
  * Hospedagem: Render.com
- * 
- * ------------------------------------------------------------------------------
- * 1. CONFIGURAÇÃO DO BANCO DE DADOS (SUPABASE SQL):
- * Execute estas queries no SQL Editor do Supabase para criar as tabelas:
- * 
- * CREATE TABLE tasks (
- *   id BIGSERIAL PRIMARY KEY,
- *   title TEXT NOT NULL,
- *   company TEXT NOT NULL,
- *   description TEXT,
- *   status TEXT NOT NULL DEFAULT 'pendente', -- 'pendente', 'em_andamento', 'concluida'
- *   assigned_to_id TEXT,
- *   assigned_to_name TEXT,
- *   completed_by_id TEXT,
- *   completed_by_name TEXT,
- *   created_at TIMESTAMPTZ DEFAULT NOW(),
- *   updated_at TIMESTAMPTZ DEFAULT NOW(),
- *   completed_at TIMESTAMPTZ
- * );
- * 
- * CREATE TABLE log_settings (
- *   guild_id TEXT PRIMARY KEY,
- *   log_channel_id TEXT NOT NULL
- * );
- * 
- * ------------------------------------------------------------------------------
- * 2. ARQUIVO `package.json` (Crie este arquivo na raiz do projeto):
- * {
- *   "name": "discord-task-bot",
- *   "version": "1.0.0",
- *   "main": "index.js",
- *   "scripts": {
- *     "start": "node index.js"
- *   },
- *   "dependencies": {
- *     "@supabase/supabase-js": "^2.39.0",
- *     "discord.js": "^14.14.1",
- *     "dotenv": "^16.4.0"
- *   }
- * }
  * ==============================================================================
  */
 
@@ -80,6 +40,7 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const LOGO_URL = process.env.LOGO_URL; // Opcional: URL personalizada para a logo
 
 if (!DISCORD_TOKEN || !CLIENT_ID || !SUPABASE_URL || !SUPABASE_KEY) {
   console.error("❌ Erro: Certifique-se de configurar DISCORD_TOKEN, CLIENT_ID, SUPABASE_URL e SUPABASE_KEY nas variáveis de ambiente!");
@@ -96,6 +57,12 @@ const client = new Client({
     GatewayIntentBits.GuildMessages
   ]
 });
+
+// Helper para obter a URL da logo (usa a do Bot ou a configurada no LOGO_URL)
+function getBotLogo() {
+  if (LOGO_URL) return LOGO_URL;
+  return client.user?.displayAvatarURL({ dynamic: true, size: 512 }) || null;
+}
 
 // Helper para calcular tempo relativo (ex: "há 1h", "há 15 min")
 function getRelativeTime(dateString) {
@@ -180,12 +147,18 @@ async function buildTasksEmbed() {
     console.error('Erro ao buscar tarefas:', activeErr || recentErr);
   }
 
+  const logo = getBotLogo();
+
   const embed = new EmbedBuilder()
     .setTitle('📋 Painel de Chamados & Tarefas das Empresas')
     .setColor('#5865F2')
     .setDescription('Acompanhe abaixo os chamados em aberto, quem está responsável e as tarefas finalizadas recentemente.')
     .setTimestamp()
-    .setFooter({ text: 'Sistema de Gerenciamento de Tarefas' });
+    .setFooter({ text: 'Sistema de Gerenciamento de Tarefas', iconURL: logo || undefined });
+
+  if (logo) {
+    embed.setThumbnail(logo);
+  }
 
   // Seção 1: Tarefas Ativas / Pendentes / Em Andamento
   if (!activeTasks || activeTasks.length === 0) {
@@ -255,12 +228,17 @@ async function buildLogEmbed(page = 1) {
 
   const totalPages = Math.ceil((count || 0) / itemsPerPage) || 1;
   const currentPage = Math.min(Math.max(1, page), totalPages);
+  const logo = getBotLogo();
 
   const embed = new EmbedBuilder()
     .setTitle('📜 Histórico Geral de Tarefas Concluídas (Logs)')
     .setColor('#2F3136')
-    .setFooter({ text: `Página ${currentPage} de ${totalPages} • Total: ${count || 0} tarefas concluídas` })
+    .setFooter({ text: `Página ${currentPage} de ${totalPages} • Total: ${count || 0} tarefas concluídas`, iconURL: logo || undefined })
     .setTimestamp();
+
+  if (logo) {
+    embed.setThumbnail(logo);
+  }
 
   if (!logs || logs.length === 0) {
     embed.setDescription('Nenhuma tarefa foi concluída até o momento.');
@@ -569,6 +547,7 @@ client.on('interactionCreate', async (interaction) => {
           try {
             const channel = await interaction.guild.channels.fetch(logSetting.log_channel_id);
             if (channel) {
+              const logo = getBotLogo();
               const logEmbed = new EmbedBuilder()
                 .setTitle('✅ Chamado Concluído!')
                 .setColor('#57F287')
@@ -579,6 +558,8 @@ client.on('interactionCreate', async (interaction) => {
                   { name: '📅 Data/Hora', value: new Date(now).toLocaleString('pt-BR'), inline: false }
                 )
                 .setTimestamp();
+
+              if (logo) logEmbed.setThumbnail(logo);
 
               await channel.send({ embeds: [logEmbed] });
             }
