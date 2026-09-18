@@ -35,17 +35,24 @@ http.createServer((req, res) => {
   console.log(`🌐 Servidor HTTP ativo na porta ${PORT} para o Render.`);
 });
 
-// Variáveis de ambiente
-const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
-const LOGO_URL = process.env.LOGO_URL;
+// Tratamento e higienização das variáveis de ambiente
+const DISCORD_TOKEN = (process.env.DISCORD_TOKEN || '').trim();
+const CLIENT_ID = (process.env.CLIENT_ID || '').trim();
+const SUPABASE_KEY = (process.env.SUPABASE_KEY || '').trim().replace(/^["']|["']$/g, '');
+
+// Limpeza rigorosa da SUPABASE_URL para evitar "Invalid path specified in request URL"
+let SUPABASE_URL = (process.env.SUPABASE_URL || '').trim().replace(/^["']|["']$/g, '');
+SUPABASE_URL = SUPABASE_URL.replace(/\/rest\/v1\/?$/i, ''); // Remove /rest/v1 se existir
+SUPABASE_URL = SUPABASE_URL.replace(/\/+$/, ''); // Remove barras no final
+
+const LOGO_URL = (process.env.LOGO_URL || '').trim();
 
 if (!DISCORD_TOKEN || !CLIENT_ID || !SUPABASE_URL || !SUPABASE_KEY) {
   console.error("❌ Erro: Certifique-se de configurar DISCORD_TOKEN, CLIENT_ID, SUPABASE_URL e SUPABASE_KEY nas variáveis de ambiente!");
   process.exit(1);
 }
+
+console.log(`🔗 Conectando ao Supabase na URL: ${SUPABASE_URL}`);
 
 // Inicializando Supabase
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
