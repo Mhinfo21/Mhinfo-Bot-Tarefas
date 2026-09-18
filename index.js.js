@@ -249,49 +249,121 @@ client.once(Events.ClientReady, async readyClient => {
 // LEMBRETES AUTOMÁTICOS
 // -----------------------------------------------------------------------------
 
+let reminderCheckRunning = false;
+
 function startReminderChecker() {
-  console.log('⏰ Lembretes automáticos ativados: checagem a cada 30 minutos.');
+  console.log(
+    '⏰ Lembretes automáticos ativados: aviso após 1 hora e checagem a cada 10 minutos.'
+  );
 
-  setInterval(async () => {
-    try {
-      const fourHoursAgo = new Date(
-        Date.now() - 4 * 60 * 60 * 1000
-      ).toISOString();
+  // Faz uma primeira verificação assim que o bot inicia.
+  checkTaskReminders();
 
-      const { data: forgottenTasks, error } = await supabase
-        .from('tasks')
-        .select('*')
-        .eq('status', 'em_andamento')
-        .lt('updated_at', fourHoursAgo);
+  setInterval(checkTaskReminders, 10 * 60 * 1000);
+}
 
-      if (error) {
-        console.error('Erro ao buscar tarefas esquecidas:', error);
-        return;
+async function checkTaskReminders() {
+  // Impede que duas verificações sejam executadas ao mesmo tempo.
+  if (reminderCheckRunning) return;
+
+  reminderCheckRunning = true;
+
+  try {
+    const oneHourAgo = new Date(
+      Date.now() - 60 * 60 * 1000
+    ).toISOString();
+
+    const { data: forgottenTasks, error } = await supabase
+      .from('tasks')
+      .select('*')
+      .eq('status', 'em_andamento')
+      .not('assigned_to_id', 'is', null)
+      .lt('updated_at', oneHourAgo);
+
+    if (error) {
+      console.error('Erro ao buscar tarefas para os lembretes:', error);
+      return;
+    }
+
+    if (!forgottenTasks || forgottenTasks.length === 0) return;
+
+    const { data: settingsData, error: settingsError } = await supabase
+      .from('log_settings')
+      .select('*');
+
+    if (settingsError) {
+      console.error('Erro ao buscar configurações de log:', settingsError);
+    }
+
+    // Mesmo sem canal configurado, o bot ainda tentará enviar a mensagem privada.
+    const settings = settingsError ? [] : (settingsData || []);
+
+    for (const task of forgottenTasks) {
+      const assignedMention = `<@${task.assigned_to_id}>`;
+
+      const reminderEmbed = new EmbedBuilder()
+        .setTitle('⏰ Lembrete de Tarefa em Andamento')
+        .setColor('#FEE75C')
+        .setDescription(
+          `A tarefa **#${task.id} - ${task.title}** ainda não foi concluída ` +
+          `e está em andamento ${getRelativeTime(task.updated_at)}.`
+        )
+        .addFields(
+          {
+            name: '🏢 Empresa',
+            value: task.company || 'Não informada',
+            inline: true
+          },
+          {
+            name: '🚨 Prioridade',
+            value: getPriorityLabel(task.priority),
+            inline: true
+          },
+          {
+            name: '👤 Responsável',
+            value: assignedMention,
+            inline: true
+          }
+        )
+        .setFooter({
+          text: 'Este é um lembrete automático da Central de Tarefas MH INFO.'
+        })
+        .setTimestamp();
+
+      // Envia o lembrete no canal definido pelo comando /config_log.
+      for (const setting of settings) {
+        try {
+          const guild = await client.guilds.fetch(setting.guild_id);
+          const channel = await guild.channels.fetch(setting.log_channel_id);
+
+          if (channel && channel.isTextBased()) {
+            await channel.send({
+              content:
+                `🔔 ${assignedMention}, você ainda possui uma tarefa em andamento. ` +
+                'Este é um lembrete para dar continuidade e concluí-la assim que possível.',
+              embeds: [reminderEmbed],
+              allowedMentions: {
+                users: [task.assigned_to_id]
+              }
+            });
+          }
+        } catch (sendError) {
+          console.error(
+            `Erro ao enviar lembrete da tarefa #${task.id} no canal:`,
+            sendError.message
+          );
+        }
       }
 
-      if (!forgottenTasks || forgottenTasks.length === 0) return;
+      // Envia também uma mensagem privada para quem assumiu a tarefa.
+      try {
+        const assignedUser = await client.users.fetch(task.assigned_to_id);
 
-      const { data: settings, error: settingsError } = await supabase
-        .from('log_settings')
-        .select('*');
-
-      if (settingsError) {
-        console.error('Erro ao buscar configurações de log:', settingsError);
-        return;
-      }
-
-      if (!settings || settings.length === 0) return;
-
-      for (const task of forgottenTasks) {
-        const assignedUser = task.assigned_to_id
-          ? `<@${task.assigned_to_id}>`
-          : task.assigned_to_name || 'Atendente';
-
-        const reminderEmbed = new EmbedBuilder()
-          .setTitle('⚠️ Lembrete de Chamado Parado')
-          .setColor('#FEE75C')
+        const privateReminderEmbed = new EmbedBuilder()
+          .setTitle('⏰ Você ainda possui uma tarefa em andamento')
+          .setColor('#0099FF')
           .setDescription(
-            `O chamado **#${task.id} - ${task.title}** está sem atualização ${getRelativeTime(task.updated_at)}.`
+            `A tarefa **#${task.id} - ${task.title}** ainda não foi marcada como concluída.`
           )
           .addFields(
             {
@@ -305,41 +377,46 @@ function startReminderChecker() {
               inline: true
             },
             {
-              name: '👤 Responsável',
-              value: assignedUser,
+              name: '⏱️ Tempo em andamento',
+              value: getRelativeTime(task.updated_at),
               inline: true
             }
           )
           .setFooter({
-            text: 'Atualize ou conclua o chamado assim que possível.'
+            text: 'MH INFO • Central de Serviços'
           })
           .setTimestamp();
 
-        for (const setting of settings) {
-          try {
-            const guild = await client.guilds.fetch(setting.guild_id);
-            const channel = await guild.channels.fetch(setting.log_channel_id);
-
-            if (channel && channel.isTextBased()) {
-              await channel.send({
-                content: `🔔 ${assignedUser}, lembrete do seu chamado!`,
-                embeds: [reminderEmbed]
-              });
-            }
-          } catch (sendError) {
-            console.error('Erro ao enviar lembrete:', sendError.message);
-          }
-        }
-
-        await supabase
-          .from('tasks')
-          .update({ updated_at: new Date().toISOString() })
-          .eq('id', task.id);
+        await assignedUser.send({
+          content:
+            '🔔 Olá! Este é um lembrete automático sobre uma tarefa que você assumiu.',
+          embeds: [privateReminderEmbed]
+        });
+      } catch (directMessageError) {
+        console.error(
+          `Não foi possível enviar mensagem privada para o responsável da tarefa #${task.id}:`,
+          directMessageError.message
+        );
       }
-    } catch (error) {
-      console.error('Erro na automação de lembretes:', error);
+
+      // Reinicia a contagem. Se continuar aberta, haverá um novo aviso após 1 hora.
+      const { error: updateError } = await supabase
+        .from('tasks')
+        .update({ updated_at: new Date().toISOString() })
+        .eq('id', task.id);
+
+      if (updateError) {
+        console.error(
+          `Erro ao atualizar o horário do lembrete da tarefa #${task.id}:`,
+          updateError
+        );
+      }
     }
-  }, 30 * 60 * 1000);
+  } catch (error) {
+    console.error('Erro na automação de lembretes:', error);
+  } finally {
+    reminderCheckRunning = false;
+  }
 }
 
 // -----------------------------------------------------------------------------
