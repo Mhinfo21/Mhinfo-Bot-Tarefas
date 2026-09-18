@@ -124,6 +124,13 @@ const commands = [
     .setDescription('Exibe todos os chamados ativos de uma empresa específica.')
     .addStringOption(opt => opt.setName('nome').setDescription('Nome da empresa para filtrar').setRequired(true)),
 
+  // /excluir_tarefa (Restrito a Administradores)
+  new SlashCommandBuilder()
+    .setName('excluir_tarefa')
+    .setDescription('Exclui permanentemente um chamado/tarefa do banco de dados (Apenas Admins).')
+    .addIntegerOption(opt => opt.setName('id').setDescription('ID numérico da tarefa a ser excluída').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
   // /log
   new SlashCommandBuilder()
     .setName('log')
@@ -432,6 +439,33 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         await interaction.editReply({ embeds: [embed] });
+        return;
+      }
+
+      if (commandName === 'excluir_tarefa') {
+        const taskId = interaction.options.getInteger('id');
+
+        const { data, error } = await supabase
+          .from('tasks')
+          .delete()
+          .eq('id', taskId)
+          .select();
+
+        if (error) {
+          console.error('Erro ao excluir tarefa:', error);
+          await interaction.reply({ content: `❌ Erro ao excluir do Supabase: \`${error.message}\``, flags: 64 });
+          return;
+        }
+
+        if (!data || data.length === 0) {
+          await interaction.reply({ content: `⚠️ Nenhuma tarefa/chamado encontrado com o ID **#${taskId}**.`, flags: 64 });
+          return;
+        }
+
+        await interaction.reply({
+          content: `🗑️ Chamado **#${taskId} - ${data[0].title}** da empresa **${data[0].company}** foi excluído com sucesso!`,
+          flags: 64
+        });
         return;
       }
 
