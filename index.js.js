@@ -40,7 +40,7 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
-const LOGO_URL = process.env.LOGO_URL; // Opcional: URL personalizada para a logo
+const LOGO_URL = process.env.LOGO_URL;
 
 if (!DISCORD_TOKEN || !CLIENT_ID || !SUPABASE_URL || !SUPABASE_KEY) {
   console.error("❌ Erro: Certifique-se de configurar DISCORD_TOKEN, CLIENT_ID, SUPABASE_URL e SUPABASE_KEY nas variáveis de ambiente!");
@@ -58,13 +58,13 @@ const client = new Client({
   ]
 });
 
-// Helper para obter a URL da logo (usa a do Bot ou a configurada no LOGO_URL)
+// Helper para obter a URL da logo
 function getBotLogo() {
   if (LOGO_URL) return LOGO_URL;
   return client.user?.displayAvatarURL({ dynamic: true, size: 512 }) || null;
 }
 
-// Helper para calcular tempo relativo (ex: "há 1h", "há 15 min")
+// Helper para calcular tempo relativo
 function getRelativeTime(dateString) {
   if (!dateString) return 'desconhecido';
   const now = new Date();
@@ -80,29 +80,52 @@ function getRelativeTime(dateString) {
   return `há ${diffDays}d`;
 }
 
+// Map de Emojis de Prioridade
+const priorityEmojis = {
+  urgente: '🔴 [URGENTE]',
+  media: '🟡 [MÉDIA]',
+  baixa: '🟢 [BAIXA]'
+};
+
 const commands = [
-  // Comando /tarefas
+  // /tarefas
   new SlashCommandBuilder()
     .setName('tarefas')
     .setDescription('Exibe o painel de chamados/tarefas pendentes, em andamento e concluídas recentemente.'),
 
-  // Comando /criar_tarefa
+  // /criar_tarefa (com Prioridade)
   new SlashCommandBuilder()
     .setName('criar_tarefa')
     .setDescription('Cria um novo chamado / tarefa para uma empresa.')
     .addStringOption(opt => opt.setName('empresa').setDescription('Nome da empresa').setRequired(true))
     .addStringOption(opt => opt.setName('titulo').setDescription('Título do chamado/tarefa').setRequired(true))
+    .addStringOption(opt => 
+      opt.setName('prioridade')
+        .setDescription('Nível de prioridade do chamado')
+        .setRequired(false)
+        .addChoices(
+          { name: '🔴 Urgente', value: 'urgente' },
+          { name: '🟡 Média', value: 'media' },
+          { name: '🟢 Baixa', value: 'baixa' }
+        )
+    )
     .addStringOption(opt => opt.setName('descricao').setDescription('Descrição detalhada do chamado').setRequired(false)),
 
-  // Comando /log (com paginação)
+  // /empresa (Filtro por empresa)
+  new SlashCommandBuilder()
+    .setName('empresa')
+    .setDescription('Exibe todos os chamados ativos de uma empresa específica.')
+    .addStringOption(opt => opt.setName('nome').setDescription('Nome da empresa para filtrar').setRequired(true)),
+
+  // /log
   new SlashCommandBuilder()
     .setName('log')
     .setDescription('Exibe o histórico de todas as tarefas concluídas (com paginação).'),
 
-  // Comando /config_log (para configurar o canal automático de logs)
+  // /config_log
   new SlashCommandBuilder()
     .setName('config_log')
-    .setDescription('Define o canal do Discord para enviar os logs de tarefas concluídas.')
+    .setDescription('Define o canal do Discord para enviar os logs de tarefas concluídas e lembretes.')
     .addChannelOption(opt => opt.setName('canal').setDescription('Selecione o canal de logs').setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
 ];
@@ -123,18 +146,88 @@ client.once('ready', async () => {
   } catch (error) {
     console.error('❌ Erro ao registrar comandos:', error);
   }
+
+  // Iniciar verificação automática de lembretes (a cada 30 minutos)
+  startReminderChecker();
 });
+
+// ⏰ AUTOMACÃO DE LEMBRETES DE TAREFAS ESQUECIDAS
+function startReminderChecker() {
+  console.log('⏰ Sistema de lembrete automático ativado (checagem a cada 30 min).');
+  
+  setInterval(async () => {
+    try {
+      const fourHoursAgo = new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString();
+
+      // Buscar tarefas "em_andamento" que não foram atualizadas há mais de 4 horas
+      // e que ainda não receberam lembrete recente
+      const { data: forgottenTasks, error } = await supabase
+        .from('tasks')
+        .select('*')
+        .eq('status', 'em_andamento')
+        .lt('updated_at', fourHoursAgo);
+
+      if (error || !forgottenTasks || forgottenTasks.length === 0) return;
+
+      // Buscar canais de logs configurados em todos os servidores
+      const { data: settings } = await supabase
+        .from('log_settings')
+        .select('*');
+
+      if (!settings || settings.length === 0) return;
+
+      for (const task of forgottenTasks) {
+        const priorityTag = priorityEmojis[task.priority || 'media'];
+        const assignedUser = task.assigned_to_id ? `<@${task.assigned_to_id}>` : (task.assigned_to_name || 'Atendente');
+        const timeAgo = getRelativeTime(task.updated_at);
+
+        const reminderEmbed = new EmbedBuilder()
+          .setTitle('⚠️ Lembrete de Chamado Parado!')
+          .setColor('#FEE75C')
+          .setDescription(`O chamado **#${task.id} - ${task.title}** está em andamento sem atualizações ${timeAgo}.`)
+          .addFields(
+            { name: '🏢 Empresa', value: task.company, inline: true },
+            { name: '🚨 Prioridade', value: priorityTag, inline: true },
+            { name: '👤 Responsável', value: assignedUser, inline: true }
+          )
+          .setFooter({ text: 'Por favor, atualize ou conclua o chamado assim que possível!' })
+          .setTimestamp();
+
+        // Enviar para os canais de log configurados
+        for (const setting of settings) {
+          try {
+            const guild = await client.guilds.fetch(setting.guild_id);
+            if (guild) {
+              const channel = await guild.channels.fetch(setting.log_channel_id);
+              if (channel) {
+                await channel.send({ content: `🔔 ${assignedUser}, lembrete do seu chamado!`, embeds: [reminderEmbed] });
+              }
+            }
+          } catch (e) {
+            console.error('Erro ao enviar lembrete:', e.message);
+          }
+        }
+
+        // Atualizar updated_at para não repetir o lembrete imediatamente
+        await supabase
+          .from('tasks')
+          .update({ updated_at: new Date().toISOString() })
+          .eq('id', task.id);
+      }
+    } catch (err) {
+      console.error('Erro na automação de lembretes:', err);
+    }
+  }, 30 * 60 * 1000); // 30 minutos
+}
 
 // Função auxiliar para gerar o Embed do /tarefas
 async function buildTasksEmbed() {
-  // Buscar tarefas em andamento e pendentes
   const { data: activeTasks, error: activeErr } = await supabase
     .from('tasks')
     .select('*')
     .in('status', ['pendente', 'em_andamento'])
     .order('created_at', { ascending: false });
 
-  // Buscar tarefas concluídas nas últimas 24 horas
   const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const { data: recentCompleted, error: recentErr } = await supabase
     .from('tasks')
@@ -143,46 +236,40 @@ async function buildTasksEmbed() {
     .gte('completed_at', twentyFourHoursAgo)
     .order('completed_at', { ascending: false });
 
-  if (activeErr || recentErr) {
-    console.error('Erro ao buscar tarefas:', activeErr || recentErr);
-  }
+  if (activeErr || recentErr) console.error('Erro ao buscar tarefas:', activeErr || recentErr);
 
   const logo = getBotLogo();
 
   const embed = new EmbedBuilder()
     .setTitle('📋 Painel de Chamados & Tarefas das Empresas')
     .setColor('#5865F2')
-    .setDescription('Acompanhe abaixo os chamados em aberto, quem está responsável e as tarefas finalizadas recentemente.')
+    .setDescription('Acompanhe abaixo os chamados em aberto, níveis de prioridade e responsáveis.')
     .setTimestamp()
     .setFooter({ text: 'Sistema de Gerenciamento de Tarefas', iconURL: logo || undefined });
 
-  if (logo) {
-    embed.setThumbnail(logo);
-  }
+  if (logo) embed.setThumbnail(logo);
 
-  // Seção 1: Tarefas Ativas / Pendentes / Em Andamento
   if (!activeTasks || activeTasks.length === 0) {
     embed.addFields({ name: '🟡 Tarefas em Andamento / Pendentes', value: 'Nenhuma tarefa pendente no momento! 🎉' });
   } else {
     let activeText = '';
     activeTasks.forEach(task => {
       const statusEmoji = task.status === 'em_andamento' ? '⏳ **[EM ANDAMENTO]**' : '🔴 **[PENDENTE]**';
-      const assigned = task.assigned_to_name ? `<@${task.assigned_to_id}>` : '*Ninguém assumiu ainda*';
+      const prio = priorityEmojis[task.priority || 'media'];
+      const assigned = task.assigned_to_id ? `<@${task.assigned_to_id}>` : '*Ninguém assumiu ainda*';
       const desc = task.description ? `\n> *${task.description}*` : '';
 
-      activeText += `**#${task.id} - ${task.title}**\n🏢 **Empresa:** ${task.company}\n${statusEmoji} | **Responsável:** ${assigned}${desc}\n\n`;
+      activeText += `**#${task.id} - ${task.title}**\n🏢 **Empresa:** ${task.company} | ${prio}\n${statusEmoji} | **Responsável:** ${assigned}${desc}\n\n`;
     });
 
     embed.addFields({ name: '📌 Chamados em Aberto', value: activeText.slice(0, 1024) });
   }
 
-  // Seção 2: Tarefas Concluídas Recentemente
   if (recentCompleted && recentCompleted.length > 0) {
     let completedText = '';
     recentCompleted.forEach(task => {
       const timeAgo = getRelativeTime(task.completed_at);
       const user = task.completed_by_id ? `<@${task.completed_by_id}>` : task.completed_by_name || 'Desconhecido';
-
       completedText += `✅ **#${task.id} - ${task.title}** (${task.company})\n└ Concluída por ${user} **${timeAgo}**\n`;
     });
 
@@ -191,7 +278,6 @@ async function buildTasksEmbed() {
     embed.addFields({ name: '🎉 Concluídas Recentemente', value: 'Nenhuma tarefa finalizada nas últimas 24h.' });
   }
 
-  // Botões de Ação
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId('btn_assumir_tarefa').setLabel('📌 Assumir Tarefa').setStyle(ButtonStyle.Primary),
     new ButtonBuilder().setCustomId('btn_concluir_tarefa').setLabel('✅ Concluir Tarefa').setStyle(ButtonStyle.Success),
@@ -202,19 +288,17 @@ async function buildTasksEmbed() {
   return { embeds: [embed], components: [row] };
 }
 
-// Função auxiliar para gerar o Embed do /log com Paginação
+// Função auxiliar para gerar Embed do /log
 async function buildLogEmbed(page = 1) {
   const itemsPerPage = 5;
   const start = (page - 1) * itemsPerPage;
   const end = start + itemsPerPage - 1;
 
-  // Buscar total de concluídas para contagem de páginas
   const { count, error: countErr } = await supabase
     .from('tasks')
     .select('*', { count: 'exact', head: true })
     .eq('status', 'concluida');
 
-  // Buscar itens da página
   const { data: logs, error } = await supabase
     .from('tasks')
     .select('*')
@@ -222,9 +306,7 @@ async function buildLogEmbed(page = 1) {
     .order('completed_at', { ascending: false })
     .range(start, end);
 
-  if (error || countErr) {
-    console.error('Erro ao buscar logs:', error || countErr);
-  }
+  if (error || countErr) console.error('Erro ao buscar logs:', error || countErr);
 
   const totalPages = Math.ceil((count || 0) / itemsPerPage) || 1;
   const currentPage = Math.min(Math.max(1, page), totalPages);
@@ -236,9 +318,7 @@ async function buildLogEmbed(page = 1) {
     .setFooter({ text: `Página ${currentPage} de ${totalPages} • Total: ${count || 0} tarefas concluídas`, iconURL: logo || undefined })
     .setTimestamp();
 
-  if (logo) {
-    embed.setThumbnail(logo);
-  }
+  if (logo) embed.setThumbnail(logo);
 
   if (!logs || logs.length === 0) {
     embed.setDescription('Nenhuma tarefa foi concluída até o momento.');
@@ -247,8 +327,9 @@ async function buildLogEmbed(page = 1) {
     logs.forEach(task => {
       const completedBy = task.completed_by_id ? `<@${task.completed_by_id}>` : (task.completed_by_name || 'N/A');
       const dataStr = task.completed_at ? new Date(task.completed_at).toLocaleString('pt-BR') : 'Data N/A';
+      const prio = priorityEmojis[task.priority || 'media'];
 
-      logContent += `**[#${task.id}] ${task.title}**\n` +
+      logContent += `**[#${task.id}] ${task.title}** (${prio})\n` +
                      `🏢 **Empresa:** ${task.company}\n` +
                      `👤 **Concluído por:** ${completedBy}\n` +
                      `📅 **Data de Conclusão:** ${dataStr}\n` +
@@ -257,22 +338,10 @@ async function buildLogEmbed(page = 1) {
     embed.setDescription(logContent);
   }
 
-  // Componentes de Paginação
   const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`log_page_${currentPage - 1}`)
-      .setLabel('◀ Anterior')
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(currentPage <= 1),
-    new ButtonBuilder()
-      .setCustomId(`log_page_${currentPage + 1}`)
-      .setLabel('Próximo ▶')
-      .setStyle(ButtonStyle.Primary)
-      .setDisabled(currentPage >= totalPages),
-    new ButtonBuilder()
-      .setCustomId('log_refresh')
-      .setLabel('🔄 Atualizar')
-      .setStyle(ButtonStyle.Secondary)
+    new ButtonBuilder().setCustomId(`log_page_${currentPage - 1}`).setLabel('◀ Anterior').setStyle(ButtonStyle.Primary).setDisabled(currentPage <= 1),
+    new ButtonBuilder().setCustomId(`log_page_${currentPage + 1}`).setLabel('Próximo ▶').setStyle(ButtonStyle.Primary).setDisabled(currentPage >= totalPages),
+    new ButtonBuilder().setCustomId('log_refresh').setLabel('🔄 Atualizar').setStyle(ButtonStyle.Secondary)
   );
 
   return { embeds: [embed], components: [row] };
@@ -296,12 +365,13 @@ client.on('interactionCreate', async (interaction) => {
       if (commandName === 'criar_tarefa') {
         const empresa = interaction.options.getString('empresa');
         const titulo = interaction.options.getString('titulo');
+        const prioridade = interaction.options.getString('prioridade') || 'media';
         const descricao = interaction.options.getString('descricao') || 'Sem descrição adicional';
 
         const { data, error } = await supabase
           .from('tasks')
           .insert([
-            { company: empresa, title: titulo, description: descricao, status: 'pendente' }
+            { company: empresa, title: titulo, priority: prioridade, description: descricao, status: 'pendente' }
           ])
           .select();
 
@@ -312,10 +382,55 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         const task = data[0];
+        const prioTag = priorityEmojis[task.priority || 'media'];
         await interaction.reply({
-          content: `✅ Chamado **#${task.id} - ${task.title}** para a empresa **${task.company}** criado com sucesso! Use \`/tarefas\` para visualizar.`,
+          content: `✅ Chamado **#${task.id} - ${task.title}** para a empresa **${task.company}** (${prioTag}) criado com sucesso! Use \`/tarefas\` para visualizar.`,
           ephemeral: false
         });
+        return;
+      }
+
+      // Comando /empresa
+      if (commandName === 'empresa') {
+        await interaction.deferReply();
+        const nomeEmpresa = interaction.options.getString('nome');
+
+        const { data: companyTasks, error } = await supabase
+          .from('tasks')
+          .select('*')
+          .ilike('company', `%${nomeEmpresa}%`)
+          .in('status', ['pendente', 'em_andamento'])
+          .order('id', { ascending: false });
+
+        if (error) {
+          console.error(error);
+          await interaction.editReply('❌ Erro ao buscar tarefas da empresa.');
+          return;
+        }
+
+        const logo = getBotLogo();
+        const embed = new EmbedBuilder()
+          .setTitle(`🏢 Chamados Ativos da Empresa: ${nomeEmpresa}`)
+          .setColor('#3498DB')
+          .setTimestamp()
+          .setFooter({ text: 'Mhinfo Bot • Filtro por Empresa', iconURL: logo || undefined });
+
+        if (logo) embed.setThumbnail(logo);
+
+        if (!companyTasks || companyTasks.length === 0) {
+          embed.setDescription(`Nenhum chamado pendente ou em andamento encontrado para "**${nomeEmpresa}**".`);
+        } else {
+          let text = '';
+          companyTasks.forEach(t => {
+            const status = t.status === 'em_andamento' ? '⏳ [EM ANDAMENTO]' : '🔴 [PENDENTE]';
+            const prio = priorityEmojis[t.priority || 'media'];
+            const assigned = t.assigned_to_id ? `<@${t.assigned_to_id}>` : '*Ninguém*';
+            text += `**#${t.id} - ${t.title}**\nStatus: ${status} | Prioridade: ${prio}\nResponsável: ${assigned}\n───────────────────────\n`;
+          });
+          embed.setDescription(text.slice(0, 4096));
+        }
+
+        await interaction.editReply({ embeds: [embed] });
         return;
       }
 
@@ -339,18 +454,17 @@ client.on('interactionCreate', async (interaction) => {
           return;
         }
 
-        await interaction.reply({ content: `✅ Canal de logs de tarefas concluídas definido para: ${channel}`, ephemeral: true });
+        await interaction.reply({ content: `✅ Canal de logs e lembretes definido para: ${channel}`, ephemeral: true });
         return;
       }
     }
 
     // --------------------------------------------------------------------------
-    // 2. INTERAÇÕES DE BOTÕES
+    // 2. BOTÕES
     // --------------------------------------------------------------------------
     if (interaction.isButton()) {
       const customId = interaction.customId;
 
-      // Botão Atualizar Painel de Tarefas
       if (customId === 'btn_atualizar_tarefas') {
         await interaction.deferUpdate();
         const payload = await buildTasksEmbed();
@@ -358,7 +472,6 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      // Botão Nova Tarefa (Abre Modal)
       if (customId === 'btn_nova_tarefa') {
         const modal = new ModalBuilder()
           .setCustomId('modal_nova_tarefa')
@@ -378,6 +491,13 @@ client.on('interactionCreate', async (interaction) => {
           .setPlaceholder('Ex: Ajustar integração de pagamentos')
           .setRequired(true);
 
+        const inputPrio = new TextInputBuilder()
+          .setCustomId('input_prioridade')
+          .setLabel('Prioridade (urgente, media, baixa)')
+          .setStyle(TextInputStyle.Short)
+          .setPlaceholder('Digite: urgente, media ou baixa')
+          .setRequired(false);
+
         const inputDesc = new TextInputBuilder()
           .setCustomId('input_descricao')
           .setLabel('Descrição Detalhada')
@@ -388,6 +508,7 @@ client.on('interactionCreate', async (interaction) => {
         modal.addComponents(
           new ActionRowBuilder().addComponents(inputEmpresa),
           new ActionRowBuilder().addComponents(inputTitulo),
+          new ActionRowBuilder().addComponents(inputPrio),
           new ActionRowBuilder().addComponents(inputDesc)
         );
 
@@ -395,7 +516,6 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      // Botão Assumir Tarefa (Exibe menu de seleção)
       if (customId === 'btn_assumir_tarefa') {
         const { data: openTasks } = await supabase
           .from('tasks')
@@ -414,8 +534,8 @@ client.on('interactionCreate', async (interaction) => {
           .setPlaceholder('Selecione uma tarefa para assumir...')
           .addOptions(
             openTasks.map(t => ({
-              label: `#${t.id} - ${t.title.slice(0, 50)}`,
-              description: `Empresa: ${t.company} | Status: ${t.status}`,
+              label: `#${t.id} - ${t.title.slice(0, 45)}`,
+              description: `Empresa: ${t.company} | Prio: ${t.priority || 'media'}`,
               value: t.id.toString()
             }))
           );
@@ -428,7 +548,6 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      // Botão Concluir Tarefa (Exibe menu de seleção)
       if (customId === 'btn_concluir_tarefa') {
         const { data: inProgress } = await supabase
           .from('tasks')
@@ -447,7 +566,7 @@ client.on('interactionCreate', async (interaction) => {
           .setPlaceholder('Selecione uma tarefa para concluir...')
           .addOptions(
             inProgress.map(t => ({
-              label: `#${t.id} - ${t.title.slice(0, 50)}`,
+              label: `#${t.id} - ${t.title.slice(0, 45)}`,
               description: `Empresa: ${t.company}`,
               value: t.id.toString()
             }))
@@ -461,7 +580,6 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
 
-      // Paginação do Log (log_page_X)
       if (customId.startsWith('log_page_')) {
         const page = parseInt(customId.split('_')[2], 10) || 1;
         await interaction.deferUpdate();
@@ -536,7 +654,6 @@ client.on('interactionCreate', async (interaction) => {
           components: []
         });
 
-        // Tentar enviar para o Canal de Logs se estiver configurado
         const { data: logSetting } = await supabase
           .from('log_settings')
           .select('log_channel_id')
@@ -554,6 +671,7 @@ client.on('interactionCreate', async (interaction) => {
                 .addFields(
                   { name: '🆔 ID / Título', value: `#${task.id} - ${task.title}`, inline: true },
                   { name: '🏢 Empresa', value: task.company, inline: true },
+                  { name: '🚨 Prioridade', value: priorityEmojis[task.priority || 'media'], inline: true },
                   { name: '👤 Concluído por', value: `<@${interaction.user.id}> (${interaction.user.username})`, inline: false },
                   { name: '📅 Data/Hora', value: new Date(now).toLocaleString('pt-BR'), inline: false }
                 )
@@ -564,7 +682,7 @@ client.on('interactionCreate', async (interaction) => {
               await channel.send({ embeds: [logEmbed] });
             }
           } catch (e) {
-            console.error('Não foi possível enviar log no canal configurado:', e);
+            console.error('Não foi possível enviar log:', e);
           }
         }
         return;
@@ -572,18 +690,25 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     // --------------------------------------------------------------------------
-    // 4. SUBMISSÃO DE MODAIS
+    // 4. MODAIS
     // --------------------------------------------------------------------------
     if (interaction.isModalSubmit()) {
       if (interaction.customId === 'modal_nova_tarefa') {
         const empresa = interaction.fields.getTextInputValue('input_empresa');
         const titulo = interaction.fields.getTextInputValue('input_titulo');
+        let prioInput = interaction.fields.getTextInputValue('input_prioridade') || 'media';
+        prioInput = prioInput.toLowerCase().trim();
+        
+        if (!['urgente', 'media', 'baixa'].includes(prioInput)) {
+          prioInput = 'media';
+        }
+
         const descricao = interaction.fields.getTextInputValue('input_descricao') || 'Sem descrição adicional';
 
         const { data, error } = await supabase
           .from('tasks')
           .insert([
-            { company: empresa, title: titulo, description: descricao, status: 'pendente' }
+            { company: empresa, title: titulo, priority: prioInput, description: descricao, status: 'pendente' }
           ])
           .select();
 
@@ -594,8 +719,10 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         const task = data[0];
+        const prioTag = priorityEmojis[task.priority || 'media'];
+
         await interaction.reply({
-          content: `✅ Chamado **#${task.id} - ${task.title}** para a empresa **${task.company}** criado com sucesso!`,
+          content: `✅ Chamado **#${task.id} - ${task.title}** para a empresa **${task.company}** (${prioTag}) criado com sucesso!`,
           ephemeral: false
         });
         return;
